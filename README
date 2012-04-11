@@ -1,0 +1,112 @@
+Daemonctrl will be the script to start/stop the process which will contain the information of list of modules and the number of instances for each module.
+
+Which internally calls the DaemonControl.pm Module which starts the parent and then  calls the start module with the module name and fork the child/children.
+
+The info regarding the process will be in proc_tbl and also a pid file <module_name.pid>.
+
+The config is passed from an external file start.conf <default config>.
+
+Config Parameters:
+# ------------------------------------------------
+#   Initialize Contfiguration Parameters
+# ------------------------------------------------
+$Config::config = {
+  'sleep_time'    => 5,
+  'start_time'    => time(),
+
+  'db_m'          => 'dbi:mysql:host=mysql:database=daemon’,
+  'db_user_m'     => ‘uname’,
+  'db_pass_m'     => 'password',
+
+  'upload_dir'    => '/home/sandeep',
+};
+1;
+
+$./daemonctrl start  [module_name].
+$./daemonctrl stop  [module_name] [-F(force exit)]
+$./daemonctrl show.
+
+
+LOGGING:
+The error logs will be logged on to a file at a specified location (LOG_DIR/<modulename.log>). 
+
+Implementation:
+Base Class
+   Base class for all perl classes.  Includes basic methods available to all
+   classes. Methods may be overridden by children if neccessary.
+
+Init Class
+    Init contains methods to read and write config (.ini) files.
+    1.  Each line in a config file can contain at most one key/value pair.
+    2.  All keys are demoted to lower case during loading.
+    3.  Any portion of a line following a '#' and including the '#' is ignored.
+
+ProcTbl Class
+  $proc_tbl->update( $count_delta ) method executes proc_ins( ..... )
+   inserting/updating row in prod_tbl with current process statistics
+
+DaemonControl class
+
+   Read the daemonctrl file for list of modules and instances and forking the process.
+
+start class
+               Perl Module/Process Wrapper
+               start initializes environment and launches a single perl process.
+
+start.conf
+     
+     Default config file for framework.
+
+./modules/module_name.conf
+
+     Separate config file for each module.
+
+./logs/module_name.pid
+
+     Contains the pid information for the parent and the forked children.
+
+daemonctrl
+# -------------------------------------
+#   Module Name, Number Of Instances
+# -------------------------------------
+my @module_list = (
+  [ 'Report',     1 ],
+);
+DaemonControl::exec(\@module_list, \@ARGV);
+
+Example:
+
+$./daemonctrl start  Report.
+
+STARTING: (./start -mReport -i0 -ls  -n 1 )
+
+$./daemonctrl show.
+
+MODULE  WHO    Inst        UID   PID  PPID START_TIME
+===========================================================
+
+Report
+        PARENT 0    sandeep  5000     1 06:59
+        CHILD  0    sandeep  5001  5000 06:59
+
+
+$./daemonctrl stop  Report -F
+
+STOPPING PROC [5000]: /usr/bin/perl -w ./start -mReport -i0 -ls -n 1
+STOPPING CHILD [5001]: /usr/bin/perl -w ./start -mReport -i0 -ls -n 1
+
+$./daemonctrl show.
+
+MODULE  WHO    Inst        UID   PID  PPID START_TIME
+===========================================================
+
+Report               **** NOT RUNNING ****
+
+$cat ./logs/Report.I0.log
+
+[sun 07dec08 06:59:02]: --- Opening new log file [Report.7.dec.08.I0] ---
+[sun 07dec08 06:59:02]: Starting Process: Report.0
+
+[sun 07dec08 06:59:02]: Starting instance [0], num_instances [1]
+
+

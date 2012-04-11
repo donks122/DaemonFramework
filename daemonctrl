@@ -1,0 +1,9 @@
+#! /usr/bin/perl -w 
+use strict;
+use DaemonControl;
+
+my @module_list = (
+  [ 'Report',     1 ],
+);
+
+DaemonControl::exec(\@module_list, \@ARGV);

@@ -1,0 +1,462 @@
+#! /usr/bin/perl -w 
+
+
+# -----------------------------------------------------------------------------
+#		start 
+#		Perl Module/Process Wrapper
+#
+#		start initializes environment and launches a single perl process. 
+#
+# -----------------------------------------------------------------------------
+
+package start;
+
+use strict;
+
+use English;
+use POSIX;
+use Getopt::Std;
+use File::Path;
+use Net::SMTP;
+
+
+BEGIN {
+    if ($] >= 5.008) {
+        unless (eval "use Encode; 1") {
+            die $@;
+        }
+    }
+}
+
+
+$ENV{DAEMON_HOME}    ||= '/home/sandeep/daemon';
+$ENV{DAEMON_RELEASE} ||= '';
+$ENV{NLS_LANG} 	  ||= "american_america.we8iso8859p1";
+
+# ------------------------------------------------
+#   Setup Signal Handlers (UNIX Only)
+# ------------------------------------------------
+
+$start::exit_flg = 0;
+$start::parent_flg = 0;
+
+my $info = `uname -s -p`;
+my ($os, $cpu) = split(/\s+/, $info);
+
+$start::mailCmd = ( $os =~ /Linux/ ) ? 'mail' : 'mailx';
+
+
+sub sig_soft {
+
+	my $signame = shift;
+
+	warn "Soft Signal Received: $signame, parent_flg=$start::parent_flg\n";
+
+	if ( $start::parent_flg ) {
+	    &notify_err(1);
+	    POSIX::_exit(0);
+	}
+
+	$start::exit_flg = 1;
+}
+
+sub sig_reaper {
+	my $waitedpid = wait;
+	$SIG{CHLD} = \&sig_reaper;
+}
+
+sub sig_hard {
+	my $signame = shift;
+	die "Hard Signal Received: $signame\n";
+}
+
+$SIG{HUP} = \&sig_soft;
+$SIG{INT} = \&sig_hard;
+$SIG{TERM} = \&sig_hard;
+$SIG{CHLD} = \&sig_reaper;
+$SIG{ALRM} = 'IGNORE';
+
+# ------------------------------------------------
+#   Register Proc Tbl Class
+# ------------------------------------------------
+
+sub get_exit_flg {
+	return $start::exit_flg;
+}
+
+sub set_exit_flg {
+    my ($flg) = @_;
+    $flg ||= 1;
+    $start::exit_flg = $flg;
+}
+
+
+# ------------------------------------------------
+#  	Get Command Line Parameters 
+#
+#			-m 'module_name' (required)
+#			-l turn on system logging (../logs)
+#			-d 'base_directory' (defaults to '../..')
+#			-i 'instance_num' (defaults to 0)
+#			-c 'module config file' (defaults to $BIZMO_HOME/module_name.conf)
+#
+# ------------------------------------------------
+
+use vars qw($opt_l $opt_m $opt_r $opt_d $opt_i $opt_s $opt_c $opt_n $opt_p);
+
+if (!&Getopt::Std::getopts('lsm:r:d:i:c:n:p:')) {
+	die "ERROR: Invalid/Unknown Option(s) Specified\n";
+}
+
+die "FATAL ERROR: Missing -m 'ModuleName'\n" if !$opt_m;
+
+my $base_dir = $opt_d || $ENV{DAEMON_HOME} || '../..';
+
+my $instance = $opt_i || 0;
+my $num_instances = $opt_n || 1;
+
+my $module_name = $opt_m;
+$module_name =~ s/\.pm$//;
+
+my $host = `hostname`;
+chomp $host;
+
+# ------------------------------------------------------
+#   Release Flag
+# ------------------------------------------------------
+=pod
+my $release = $opt_r || $ENV{BIZMO_RELEASE} || 'prod';
+
+if ( !grep $_ eq $release, qw{dev prod qa test} ) {
+  die "ERROR: Unknown -r 'ReleaseType' option [$release]\n";
+}
+=cut
+# ------------------------------------------------
+#   Initialize Contfiguration Parameters
+# ------------------------------------------------
+
+require Init;
+my $config = Init->new( );
+$config->set( {
+  'module_name' => $module_name,
+  #'release'     => $release,
+  'base_dir'    => $base_dir,
+  'instance'    => $instance,
+  'num_instances' => $num_instances,
+} );
+
+# ------------------------------------------------
+#   Load Base Configuration
+# ------------------------------------------------
+
+$config->read( "$base_dir/start.conf" );
+
+# ------------------------------------------------
+#   Load Module Configuration
+# ------------------------------------------------
+
+warn "Reading config file $opt_c\n" if ( $opt_c );
+
+$config->read( $opt_c || "$base_dir/modules/$module_name.conf" );
+
+my $log_dir = &open_log_dir($base_dir);
+my $log_file = "$module_name.I$instance";
+
+
+# ------------------------------------------------
+#   Initialize And Open STDERR For Logging
+# ------------------------------------------------
+
+$Getopt::Std::opt_l ||= '';
+if ($Getopt::Std::opt_l) {
+
+	# -------------------------------------------------------------
+	#		Add Timestamp to WARN and DIE Messages
+	# -------------------------------------------------------------
+
+	$SIG{__WARN__} = sub {
+		my ($warning) = @_;
+		my ($sec, $min, $hour, $day, $mon, $year, $wday) = localtime(time());
+		my $buffer = sprintf "[%s %02d%s%02d %02d:%02d:%02d]: %s", 
+			(qw{sun mon tue wed thu fri sat})[$wday], $day,
+			(qw{jan feb mar apr may jun jul aug sep oct nov dec})[$mon],
+			$year % 100, $hour, $min, $sec, $warning;
+
+		print STDERR $buffer;
+		if ($start::proc_tbl) {
+			$start::proc_tbl->proc_text( $buffer );
+		}
+	};
+
+	$SIG{__DIE__} = sub {
+		my ($warning) = @_;
+
+		my ($sec, $min, $hour, $day, $mon, $year, $wday) = localtime(time());
+		my $buffer = sprintf "[%s %02d%s%02d %02d:%02d:%02d]: %s", 
+			(qw{sun mon tue wed thu fri sat})[$wday], $day,
+			(qw{jan feb mar apr may jun jul aug sep oct nov dec})[$mon],
+			$year % 100, $hour, $min, $sec, $warning;
+
+		print STDERR $buffer;
+		if ($start::proc_tbl) {
+			$start::proc_tbl->proc_text( $buffer );
+		}
+
+		POSIX::_exit(0);
+
+	};
+
+	&open_log_file( $base_dir, $module_name, $instance );
+
+}
+
+
+# --------------------------------------------------------
+#		Initialize object and start object action	
+# --------------------------------------------------------
+
+select STDOUT; $| = 1;
+
+my $parent_pid = 0;
+
+# ------------------------------------------------
+#   Run In Supervisor Mode
+# ------------------------------------------------
+
+if ( $opt_s ) {
+
+	DAEMON: {
+
+		my ($pid);
+		if ( $pid = fork ) {
+			POSIX::_exit( 0 );
+		}
+		elsif ( !defined($pid) ) {
+			if ( $! =~ /No more process/i ) {
+				sleep 5;
+				redo DAEMON;
+			}
+			else {
+				die "FATAL ERROR: Can't fork: $!\n";
+			}
+		}
+
+	}
+
+	my $fail_count   = 0;
+	my $max_fails    = $config->{max_proc_fails} || 3;
+
+	FORK: {
+
+		$start::parent_flg = 0;
+
+		my ($pid);
+
+		if ( $pid = fork ) {
+
+			$start::parent_flg = 1;
+			$parent_pid = $pid;	
+			waitpid $pid, 0;
+
+			if ( ++$fail_count % $max_fails == 0 ) {
+			    &notify_err($fail_count);
+			    $fail_count = 0;
+			}
+
+			sleep 10;
+
+			redo FORK;
+		}
+		elsif ( !defined($pid) ) {
+			if ( $! =~ /No more process/i ) {
+				sleep 5;
+				redo FORK;
+			}
+			else {
+				die "FATAL ERROR: Can't fork: $!\n";
+			}
+		}
+
+	}
+
+}
+
+# ------------------------------------------------
+#   create pid files
+# ------------------------------------------------
+
+
+my $child_pid  = POSIX::getpid();
+
+open PID, ">$log_dir/$log_file.pid";
+print PID "$parent_pid $child_pid\n";
+close PID;
+
+
+
+warn "Starting Process: $module_name.$instance \n\n";
+
+require ProcTbl;
+
+$start::proc_tbl = ProcTbl->new( $config );
+$start::proc_tbl->update( 0 );
+$start::proc_tbl->sys_action( 'start', "Starting Process: $module_name.$instance" );
+
+$opt_p ||= '';
+
+my $code = qq{
+  use $module_name;
+  my \$object = $module_name->new( \$config );
+  \$object->action( \$start::proc_tbl, \"$opt_p\" );
+};
+
+$start::exit_flg = 0;
+
+eval( $code );
+
+
+if ($@) {
+  warn "Terminal Eval Error: $@";
+}
+
+$start::proc_tbl->delete( );
+$start::proc_tbl->sys_action( 'stop', "Exiting Process: $module_name.$instance" );
+
+die "Exiting Process: $module_name.$instance\n\n";
+
+
+# -------------------------------------------------------------
+#		Open log dir
+# -------------------------------------------------------------
+
+sub open_log_dir {
+
+	my ($base_dir) = @_;
+
+  my $log_dir = "$base_dir/logs";
+
+  if ( !(-e $log_dir) && !mkpath( $log_dir ) ) {
+    warn "ERROR: unable to create log directory [$log_dir]";
+  }
+
+	return $log_dir;
+}
+
+# -------------------------------------------------------------
+#		Open STDERR For Logging
+# -------------------------------------------------------------
+
+sub open_log_file {
+	my ($base_dir, $module_name, $instance) = @_;
+
+	$instance ||= 0;
+	my ($sec, $min, $hour, $day, $mon, $year, $wday) = localtime(time());
+
+	$year = sprintf "%02d", $year % 100;
+	$mon = (qw{jan feb mar apr may jun jul aug sep oct nov dec})[$mon];
+
+	my $log_dir = &open_log_dir($base_dir);
+
+	my $log_file = "$module_name.$day.$mon.$year.I$instance";
+	
+	close STDERR;
+
+	if ( !(-e "$log_dir/$log_file") || (-M "$log_dir/$log_file" > 5) ) {
+		open STDERR, ">$log_dir/$log_file";
+		warn "--- Opening new log file [$log_file] ---\n";
+
+		eval { 
+		    
+		    my $f = readlink("$log_dir/$module_name.I$instance.log"); 
+		    
+		    `gzip $log_dir/$f &` if ( $f );
+		};
+		
+	}
+	else {
+		open STDERR, ">>$log_dir/$log_file";
+		print STDERR "\n\n";
+		warn "--- Appending To Existing log file [$log_file] ---\n";
+	}
+
+	eval { unlink( "$log_dir/$module_name.I$instance.log" ) };
+	eval { symlink( "$log_file", "$log_dir/$module_name.I$instance.log" ) };
+
+	# -------------------------------------------------------------
+	#		Cleanup Old Log Files In Directory
+	# -------------------------------------------------------------
+
+	if ( !opendir(DIRHANDLE, $log_dir) ) {
+		warn "ERROR: Unable to open directory [$log_dir]: $!";
+  }
+
+  my @files = grep !/^\./, readdir DIRHANDLE;
+  close DIRHANDLE;
+
+  my $max_log_days = $config->{max_log_days} || 14;
+
+  unlink grep( -M $_ > $max_log_days, map( "$log_dir/$_", @files ) );
+
+	# --------------------------------------------------------------
+	#		Turn On AutoFlushing
+	# --------------------------------------------------------------
+
+	select STDERR; $| = 1; select STDOUT; $| = 1;
+
+}
+
+sub notify_err {
+
+    my ($count, $err_msg) = @_;
+
+    my $notify_addrs = $config->{admin_notify} || [ ];
+
+    my $buf;
+    
+    if ( $err_msg ) {
+	$buf = $err_msg;
+    } else {
+	$buf = "ERROR: the daemon for $module_name, Instance $instance Failed $count times on $host";
+    }
+
+    warn "$buf\n";
+
+    if ( scalar(@$notify_addrs) > 0 ) {
+
+	my $send_to = join(' ', @$notify_addrs);
+	
+	system ("$start::mailCmd -s 'SYSTEM ERROR!' $send_to <<EOF\n$buf\nEOF");
+    }
+
+    return;
+    
+    foreach my $addr ( @$notify_addrs ) {
+	
+	$addr =~ /\@(.+)$/;
+	my $mail_server = $1;
+	
+	next if ( !$mail_server );
+	
+	my $smtp = Net::SMTP->new( $mail_server,
+				   Hello => 'localhost',
+				   Timeout => 90,
+				   );
+	if ( $smtp ) {
+	    $smtp->mail($addr);
+	    $smtp->to($addr);
+	    $smtp->data();
+	    $smtp->datasend("To: $addr\n");
+	    $smtp->datasend("From: admin\n");
+	    $smtp->datasend("Subject: SYSTEM ERROR!\n");
+	    $smtp->datasend("\n");
+	    $smtp->datasend($buf);
+	    $smtp->dataend();
+	    $smtp->quit;
+	}
+    }
+    
+    warn "$buf\n";
+}
+    
+
+
